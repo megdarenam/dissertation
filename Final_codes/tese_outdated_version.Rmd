@@ -1,0 +1,1842 @@
+---
+
+title: "Your title here"
+Author: "Renam Megda"
+date: "Todays date"
+output: 
+  html_document:
+    theme: journal
+    highlight: espresso
+    toc: true
+    toc_depth: 4
+    toc_float: true
+---
+# 60 Observações
+
+# Base e análise dos dados
+
+## Libraries
+
+```{r , message=FALSE}
+
+library(tvReg)
+library(data.table)
+library(sidrar)
+library(ggplot2)
+library(zoo)
+library(readr)
+library(quantmod)
+library(lmtest)
+library(aTSA)
+library(matrixStats)
+library(dplyr)
+library(strucchange)
+library(reshape)
+library(TSclust)
+library(dynlm)
+library(dtwclust)
+library(quantreg)
+library(MTS)
+library(MSwM)
+library(glmnet)
+library(xtable)
+
+rm(list = ls())
+
+set.seed(1000)
+
+setwd("\\Users\\megda\\OneDrive\\Dissertação")
+
+```
+
+
+## Arrumando base de dados
+
+1. Produção industrial desasonalizada $= \Delta_{12}prod\_ind$.
+2. Primeira diferença do produto desasonalizado $= \Delta\Delta_{12}prod\_ind_{t} =d\_desas\_prod$.
+3. Produto diferenciado pela média móvel de 4 $=  \Delta_{12}prod\_ind{t} - \frac{1}{4}\sum_{i=1}^{4}\Delta_{12}prod\_ind_{t-i} = sdd\_desas\_prod$
+
+```{r}
+
+rm(list = ls())
+
+data <- read.csv("data_prod_ind.csv")
+
+data <- data[13:nrow(data),]
+
+sdd_desas_prod <- 0
+sdd_MA <- 0
+
+### Gerando a primeira diferença do produto desasonalizado 
+
+data$d_desas_prod <- c(NA, diff(data$desas_prod))
+
+### Gerando médias móveis do produto desasonalizado (PI em sua décima segunda
+### diferença)
+
+for (i in 5:nrow(data)){
+  sdd_desas_prod[i-4] <- data$desas_prod[i] -
+    (data$desas_prod[i-1]+data$desas_prod[i-2]+data$desas_prod[i-3]+
+       data$desas_prod[i-4])/4
+  sdd_MA[i-4] <- (data$desas_prod[i-1]+data$desas_prod[i-2]+data$desas_prod[i-3]+
+       data$desas_prod[i-4])/4
+}
+
+### Como as 4 primeiras observações não possuem uma média móvel de 4 períodos,
+### retirei-as.
+
+data <- data[c(-1:-4),]
+
+data$sdd_MA <- sdd_MA
+data$sdd_desas_prod <- sdd_desas_prod
+
+rownames(data) <- c(1:nrow(data))
+
+rm(list = c("sdd_MA" , "sdd_desas_prod"))
+
+write_csv(data , "data_tratada_.csv")
+
+
+```
+
+
+## CUSUM test
+
+Pelo CUSUM test, é possível perceber que temos uma quebra estrutural. Já com 
+relação à série desasonalizada, podemos perceber pelo plot que ela exibe 
+estacionariedade, com alguns pontos de quebra. O teste ADF, mesmo com a presença
+de tais quebras, não indica não estacionariedade.
+
+```{r}
+  sa_cusum <- efp(desas_prod ~ 1 + lag(desas_prod) + lag(desas_prod , 2) + 
+                    lag(desas_prod , 3) + lag(desas_prod , 4) + 
+                    lag(desas_prod , 5) + lag(desas_prod , 6) + 
+                    lag(desas_prod , 7) + lag(desas_prod , 8)+
+                    lag(desas_prod , 9) + lag(desas_prod , 10)+
+                    lag(desas_prod , 11) + lag(desas_prod , 12), data = data, type = "Rec-CUSUM")
+adf.test(data$desas_prod)
+par(c(2,1))
+plot(sa_cusum)
+plot(data$desas_prod , type  = 'line')
+
+
+```
+
+
+## Bai & Perron (2013)
+
+Pelo teste de Bai & Perron de múltiplas quebras estruturais, temos quebras nos 
+finais de 2008, 2011 e 2014. 
+
+```{r}
+aux_xts <- ts(data$prod_ind , start = 1 , end = 235 , frequency = 1)
+time <- (1:length(aux_xts))
+a <- breakpoints(aux_xts~1)
+
+data$date[c(a$breakpoints)]
+
+rm(list = c("aux_xts" , "time" , "a"))
+
+```
+
+## Chow test
+
+Já pelo teste de Chow, temos indícios de quebras a um nível de significância de 
+5% em dezembro de 2008, março de 2010 e abril de 2020.
+
+![Chow test para produção industrial.](/Users/megda/OneDrive/Dissertação/chow_test.png)
+
+
+
+## Parâmetros
+
+1. Window_size = tamanho da janela fixa utilizada.
+2. repetitions = Número de estimações realizadas à medida que andamos com 
+a janela
+3. Horizonte = horizonte de previsão
+
+```{r}
+
+window_size <- 60
+repetitions <- nrow(data) - 12 - window_size
+horizonte <- 12
+
+```
+
+
+## Listas e dataframes 
+
+Os dataframes que iniciam em *level_sample* são dataframes que contém nas linhas a 
+amostra junto com os 12 valores preditos para o nível da variável para cada 
+repetição das estimações (estou trabalhando com janela fixa). O data frame 
+*sample_and_predicted* irá conter a amostra da janela fixa junto com estimativas 
+feitas para a variável desasonalizada ($\Delta_{12}prod\_ind$) para cada um dos 
+modelos durante as repetições das estimações. Isso facilitará na hora de 
+converter nossas estimativas da produção desasonalizada para o nível estimado da 
+produção industrial.
+
+```{r}
+
+### Listas para salvar os resultados das regressões ###
+#######################################
+
+saved_models_AR13 <- list()
+
+saved_models_AR1 <- list()
+
+saved_models_RW <- list()
+
+saved_models_DDD <- list()
+
+saved_models_SDD <- list()
+
+saved_models_AR13_IC <- list()
+
+saved_models_tvVAR<- list()
+
+saved_models_lasso_ar13 <- list()
+
+saved_models_adalasso_ar13 <- list()
+
+### Listas para salvar os valores da amostra junto com os valores preditos ###
+#######################################
+
+sample_and_predicted <- replicate(1:(window_size + horizonte),
+                                  n = repetitions+1) %>%
+  as.data.frame()
+
+sample_and_predicted <- as.data.frame(sample_and_predicted)
+
+level_sample_cluster <- sample_and_predicted
+
+level_sample_cluster_combination <- sample_and_predicted
+
+level_sample_cluster_rls <- sample_and_predicted
+
+level_sample_AR1<- sample_and_predicted
+
+level_sample_cluster_check<- sample_and_predicted
+
+level_sample_AR13 <- sample_and_predicted
+
+level_sample_msAR13 <- sample_and_predicted
+
+level_sample_RW <- sample_and_predicted
+
+level_sample_DDD <-sample_and_predicted
+
+level_sample_SDD <-sample_and_predicted
+
+level_sample_AR13_IC <- sample_and_predicted
+
+level_sample_tvVAR <-  sample_and_predicted
+
+level_sample_lasso_AR13 <- sample_and_predicted
+
+level_sample_adalasso_AR13 <- sample_and_predicted
+
+
+data$date <- as.Date(data$date)
+
+## Aqui abaixo temos um dataframe auxiliar para a parte de markov switch e 
+### LASSO-AR(13)
+
+tf <- length(data[, 1]) * 14
+
+matrix_desas_prod <- 
+  matrix(rep(NA , times =  tf) , nrow = nrow(data) , ncol = 14 ) |>
+  as.data.frame()
+
+matrix_d_desas_prod <- 
+  matrix(rep(NA , times =  tf) , nrow = nrow(data) , ncol = 14 ) |>
+  as.data.frame()
+
+
+for (i in 1:14){
+  
+  matrix_desas_prod[(i:nrow(matrix_desas_prod)) , i] <- 
+    data$desas_prod[1:(nrow(matrix_desas_prod) + 1 - i)]
+  
+  aux <- i - 1
+  
+  colnames(matrix_desas_prod)[i] <- paste0("desas_prod.-" , aux)
+  
+  
+}
+colnames(matrix_desas_prod)[1] <- "desas_prod"
+
+for (i in 1:14){
+  
+  matrix_d_desas_prod[(i:nrow(matrix_d_desas_prod)) , i] <- 
+    data$d_desas_prod[1:(nrow(matrix_d_desas_prod) + 1 - i)]
+  
+  aux <- i - 1
+  
+  colnames(matrix_d_desas_prod)[i] <- paste0("d_desas_prod.-" , aux)
+  
+  
+}
+colnames(matrix_d_desas_prod)[1] <- "d_desas_prod"
+
+```
+
+
+# Método Direto
+
+## Modelo AR(13)
+
+A seguir, a estimação do modelo AR(13). Aqui temos o modelo estimado de maneira
+*direta*, ou seja, para a previsão para h passos a frente, a forma funcional
+será: $\Delta_{12}prod\_ind_{t} = \beta_{0}^{h} + \sum_{i = h}^{i = h +12}\beta_{1 + i - h }^{h}\Delta_{12}prod\_ind_{t-i} + \epsilon_{t}$, onde $h$ é o horizonte de 
+previsão e estimamos coeficientes a cada horizonte analisado. Temos então que
+$\hat{\Delta_{12}prod\_ind_{t+h}} = \hat{\beta_{0}^{h}} + \sum_{i = 1}^{i = 13}\hat{\beta_{i}^{h}}\Delta_{12}prod\_ind_{t}$. Note que $prod\_ind_{t}$ está
+dentro da amostra. Para os demais modelos, a lógica é a mesma. 
+
+Para recuperar o nível da série utilizando as 
+estimativas basta fazer $\hat{prod\_ind_{t+h}} = \hat{\Delta_{12}prod\_ind_{t+h}} + prod\_ind_{t + h - 12}$. 
+Como o horizonte vai até 12, $prod\_ind_{t + h - 12}$ está sempre dentro da 
+amostra. 
+
+```{r , results='hide'}
+
+for(i in 0:repetitions){
+
+  in_sample <- data[(1 + i):(window_size + i), ]
+
+  level_sample_AR13[(1:nrow(in_sample)) , (i+1)] <- in_sample$prod_ind
+
+  sample_and_predicted[(1:nrow(in_sample)) , (i+1)] <- in_sample$desas_prod
+
+  xts_in_sample <- ts(in_sample$desas_prod)
+
+  print(i)
+
+  for (j in 1:horizonte){
+    
+    ### low será o índice da observação no instante "t" e up o índice da
+    ### defasagem de ordem 13
+    
+    low <- window_size
+    up <- window_size - 12
+
+    saved_models_AR13[[i+1]] <- dynlm(xts_in_sample ~ L(xts_in_sample , j:(j+12)))[[1]]
+
+    aux_vec_lags <- as.matrix(rep(1 , times = 14), nrow = 1 , ncol = 14)
+
+    ### O aux_vec_lags é um vetor que contém as 13 primeiras defasagens
+    
+    aux_vec_lags[2:14] <- sample_and_predicted[low:up , (1+i)]
+
+    aux_vec_lags <- t(aux_vec_lags)
+    
+    ### saved_models_AR13[[i + 1]] contém os coeficientes da repetição i
+    
+    aux_factor <- aux_vec_lags %*%
+      saved_models_AR13[[i + 1]]
+
+    sample_and_predicted[(nrow(in_sample) + j) , (i + 1)] <- aux_factor[[1]]
+
+    level_sample_AR13[(nrow(in_sample) + j) , (i + 1)] <- aux_factor[[1]] +
+      level_sample_AR13[(nrow(in_sample + j - 12) ) , (i + 1)]
+
+    
+  }
+
+}
+
+```
+
+## AR 1
+
+```{r , results='hide'}
+
+for(i in 0:repetitions){
+
+  in_sample <- data[(1 + i):(window_size + i), ]
+
+  level_sample_AR1[(1:nrow(in_sample)) , (i+1)] <- in_sample$prod_ind
+
+  sample_and_predicted[(1:nrow(in_sample)) , (i+1)] <- in_sample$desas_prod
+
+  xts_in_sample <- ts(in_sample$desas_prod)
+
+  print(i)
+
+  for (j in 1:horizonte){
+    
+    ### low será o índice da observação no instante "t" e up o índice da
+    ### defasagem de ordem 13
+    
+    low <- window_size
+
+    saved_models_AR1[[i+1]] <- dynlm(xts_in_sample ~ L(xts_in_sample , j))[[1]]
+
+    aux_vec_lags <- as.matrix(rep(1 , times = 2), nrow = 1 , ncol = 2)
+
+    ### O aux_vec_lags é um vetor que contém as 13 primeiras defasagens
+    
+    aux_vec_lags[2] <- sample_and_predicted[low, (1+i)]
+
+    aux_vec_lags <- t(aux_vec_lags)
+    
+    ### saved_models_AR13[[i + 1]] contém os coeficientes da repetição i
+    
+    aux_factor <- aux_vec_lags %*%
+      saved_models_AR1[[i + 1]]
+
+    sample_and_predicted[(nrow(in_sample) + j) , (i + 1)] <- aux_factor[[1]]
+
+    level_sample_AR1[(nrow(in_sample) + j) , (i + 1)] <- aux_factor[[1]] +
+      level_sample_AR1[(nrow(in_sample + j - 12) ) , (i + 1)]
+
+    
+  }
+
+}
+
+```
+
+## Modelo RW
+
+Aqui temos um modelo de random walk sem drift, ou seja, $\Delta_{12}prod\_ind_{t+h} = \Delta_{12}prod\_ind_{t+h-1} + \epsilon_{t} = \Delta_{12}prod\_ind_{t} + \epsilon_{t}$.
+
+```{r , results='hide'}
+for(i in 0:repetitions){
+
+  in_sample <- data[(1 + i):(window_size + i), ]
+  #out_sample <- data[(window_size + i + 1):(nrow(data)), ]
+
+  level_sample_RW[(1:nrow(in_sample)) , (i+1)] <- in_sample$prod_ind
+  sample_and_predicted[(1:nrow(in_sample)) , (i+1)] <- in_sample$desas_prod
+
+
+  print(i)
+
+  for (j in 1:horizonte){
+
+    low <- window_size + i + j
+    up <- window_size + i + j - 12
+
+    sample_and_predicted[(nrow(in_sample) + j) , (i + 1)] <- 
+      sample_and_predicted[(nrow(in_sample)) , (i + 1)]
+
+    level_sample_RW[(nrow(in_sample) + j) , (i + 1)] <- 
+      sample_and_predicted[(nrow(in_sample) + j) , (i + 1)] +
+      level_sample_RW[(nrow(in_sample) + j - 12) , (i + 1)]
+
+    
+  }
+
+}
+```
+
+## Modelo em dupla diferença (DDD)
+
+Aqui começo estimando um AR(1):
+
+1. $\Delta\Delta_{12}prod\_ind_{t} = \beta_{1}^{h}\Delta\Delta_{12}prod\_ind_{t-h}$
+
+Com isso, podemos obter, recursivamente (omitindo o termo de erro para simplificar):
+
+\begin{gather*}
+  \Delta\Delta_{12}prod\_ind_{t+h} = \beta_{1}^{h}\Delta\Delta_{12}prod\_ind_{t} \to \\
+  \Delta_{12}prod\_ind_{t+h} = \Delta_{12}prod\_ind_{t+h-1} + \beta_{1}^{h}\Delta\Delta_{12}prod\_ind_{t} \to\\
+  \Delta_{12}prod\_ind_{t+h} = \Delta_{12}prod\_ind_{t+h-2} + \beta_{1}^{h}\Delta\Delta_{12}prod\_ind_{t-1} + \beta_{1}^{h}\Delta\Delta_{12}prod\_ind_{t} \to \\
+  \Delta_{12}prod\_ind_{t+h} = \Delta_{12}prod\_ind_{t+h-3} +\beta_{1}^{h}\Delta\Delta_{12}prod\_ind_{t-2} +\beta_{1}^{h}\Delta\Delta_{12}prod\_ind_{t-1} + \beta_{1}^{h}\Delta\Delta_{12}prod\_ind_{t} \\
+  \ldots \\
+  \Delta_{12}prod\_ind_{t+h} = \Delta_{12}prod\_ind_{t} + \beta_{1}^{h}\sum_{i=t}^{t-(h-1)}\Delta\Delta_{12}prod\_ind_{i} 
+\end{gather*}
+
+Assim, para estimar para $h$ passo a frente de mandeira direta, basta fazer:
+
+\begin{gather*}
+  \hat{\Delta_{12}prod\_ind_{t+h}} = \Delta_{12}prod\_ind_{t} + \hat{\beta_{1}^{h}}x_{t}
+\end{gather*}
+
+onde h é o super escrito que indica que estamos utilizando o beta estimado para
+o horizonte "h" em análise, $x_{t} = \sum_{i=t}^{t-(h-1)}\Delta\Delta_{12}prod\_ind_{i}$ e 
+$\hat{\beta_{1}^{h}}$ é estimado por 1. acima. Após isso, conseguimos obter: 
+
+\begin{gather}
+  \hat{prod\_ind_{t+h}} = prod\_ind_{t+h-12} + \Delta_{12}prod\_ind_{t} + \hat{\beta_{1}^{h}}x_{t} = \\
+  \hat{prod\_ind_{t+h}} = prod\_ind_{t+h-12} + \hat{\Delta_{12}prod\_ind_{t+h}}
+\end{gather}
+
+
+```{r , results='hide'}
+
+### Criando objeto para salvar a produção desasonalizada, visto que agora a 
+### variável que eu salvo no sample_and_predicted é a dupla diferença e não mais
+### a produção desasonalizada
+
+desas_prod_DDD <-  replicate(1:(window_size + horizonte),
+                         n = repetitions+1) %>%
+  as.data.frame()
+#####
+
+
+for(i in 0:repetitions){
+
+  in_sample <- data[(1 + i):(window_size + i), ]
+
+  level_sample_DDD[(1:nrow(in_sample)) , (i+1)] <- in_sample$prod_ind
+
+  sample_and_predicted[(1:nrow(in_sample)) , (i+1)] <- in_sample$d_desas_prod
+
+  desas_prod_DDD[(1:nrow(in_sample)) , (i+1)] <- in_sample$desas_prod
+
+  xts_in_sample <- ts(in_sample$d_desas_prod)
+
+
+  print(i)
+
+  for (j in 1:horizonte){
+    
+    ### Criando variável x_t
+    
+    x_t <- sum(in_sample$d_desas_prod[(nrow(in_sample)-j+1):nrow(in_sample)])
+
+    ### estimando o modelo (número 1 das equações acima)
+    
+    saved_models_DDD[[i+1]] <- saved_models_AR1[[i+1]][2]
+    
+    ###
+    
+    ### criando o índice de "t" (defas_1) e o índice de "t + h - 12"
+    
+    defas_1 <- window_size
+    defas_12 <- window_size + j - 12
+    
+    ###
+    
+    ### Obtendo a estimativa para a produção industrial desasonalizada no 
+    ### período "t + h" 
+    
+   desas_prod_DDD[(nrow(in_sample) + j) , (i + 1)] <-
+      desas_prod_DDD[defas_1 , (i+1)] + #produção desasonalizada no período t
+      saved_models_DDD[[i+1]][[1]]*x_t
+   
+    ###  
+   
+   ### Obtendo a estimativa para a dupla diferença (equação 2 acima)
+   
+   sample_and_predicted[(nrow(in_sample) + j) , (i + 1)] <-
+      saved_models_DDD[[i + 1]][[1]]*sample_and_predicted[defas_1 , (i+1)]
+   
+   ###
+   
+   ### Recuperando o nível da variável
+   
+    level_sample_DDD[(nrow(in_sample) + j) , (i + 1)] <-
+      level_sample_DDD[defas_12 , (1+i)] + # prod_ind no tempo "t+h-12" 
+      desas_prod_DDD[(nrow(in_sample) + j) , (i + 1)] # prod_ind desasonalizada
+                                                        # estimada
+   ###
+
+    
+  }
+}
+
+```
+
+## Modelo em dupla diferença suavizado (SDD)
+
+
+## Modelo SDD
+
+```{r}
+
+rm(desas_prod)
+sdd_ma <- replicate(1:(window_size + horizonte),
+                                  n = repetitions+1) %>%
+  as.data.frame()
+
+defas_sdd_ma <- 0
+desas_prod <-  replicate(1:(window_size + horizonte),
+                     n = repetitions+1) %>%
+  as.data.frame()
+
+###
+
+for(i in 0:repetitions){
+
+  in_sample <- data[(1 + i):(window_size + i), ]
+  out_sample <- data[(window_size + i + 1):(nrow(data)), ]
+
+  level_sample_SDD[(1:nrow(in_sample)) , (i+1)] <- in_sample$prod_ind
+
+  sample_and_predicted[(1:nrow(in_sample)) , (i+1)] <- in_sample$sdd_desas_prod
+
+  sdd_ma[(1:nrow(in_sample)) , (i+1)] <- in_sample$sdd_MA
+
+  desas_prod[(1:nrow(in_sample)) , (i+1)] <- in_sample$desas_prod
+
+  xts_in_sample <- ts(in_sample$sdd_desas_prod)
+
+
+  print(i)
+
+  for (j in 1:horizonte){
+    
+    
+    saved_models_SDD[[i+1]] <- saved_models_AR1[[i+1]][2]
+
+    
+    low <- window_size 
+
+    sdd_ma[(nrow(in_sample) + j) , (i + 1)] <-
+      (desas_prod[(nrow(in_sample) + j - 1), (i + 1)] +
+         desas_prod[(nrow(in_sample) + j - 2), (i + 1)] +
+         desas_prod[(nrow(in_sample) + j - 3), (i + 1)] +
+         desas_prod[(nrow(in_sample) + j - 4), (i + 1)])/4
+    
+    ## 1.
+    aux_factor <- 
+      sample_and_predicted[low , (i+1)]*saved_models_SDD[[i + 1]][[1]]
+    
+    sample_and_predicted[(nrow(in_sample) + j) , (i + 1)] <- aux_factor
+    
+    ##
+    
+    ## 2.
+    desas_prod[(nrow(in_sample) + j), (i + 1)] <-
+      sdd_ma[(nrow(in_sample) + j) , (i + 1)] + # Média móvel em "t" de 
+                                                ## desas_prod
+      
+      sample_and_predicted[(nrow(in_sample) + j) , (i + 1)] #sdd_desas_prod
+    
+    ##
+    
+    ##3.
+    level_sample_SDD[(nrow(in_sample) + j) , (i + 1)] <-
+      level_sample_SDD[(nrow(in_sample) + j - 12) , (i + 1)] +
+      desas_prod[(nrow(in_sample) + j), (i + 1)] 
+    
+  }
+}
+
+```
+
+
+
+## Modelo AR13 + INTERCEPT CORRECTION (AR13 + IC)
+
+Aqui, temos o modelo:
+
+1. $\tilde{\Delta_{12}prod\_ind_{t+h}} = \hat{\Delta_{12}prod\_ind_{t+h}} + \hat{\epsilon_{t}^{h}}$
+
+Onde $\hat{\Delta_{12}prod\_ind_{t+h}}$ e $\hat{\epsilon_{t}^{h}}$ são estimados
+pelo modelo AR(13) anterior e, novamente, o super escrito h indica a estimativa 
+utilizando a estimativa de coeficientes para o horizonte $h$. Temos assim que, 
+para cada horizonte, estimamos o resíduo no tempo "t" (dentro da amostra) 
+utilizando os coeficientes estimados para o horizonte $h$. Para obter a 
+estimativa do nível da produção, basta somar à estimativa do modelo AR(13) esse
+resíduo estimado.
+
+Em outras palavras, o resíduo é:
+
+\begin{gather*}
+
+\hat{\epsilon_{t}^{h}} = \Delta_{12}prod\_ind_{t} - \hat{\Delta_{12}prod\_ind_{t}^{h}}
+
+\end{gather*}
+
+```{r , results='hide'}
+### AR 13 + IC ###
+##################
+
+for(i in 0:repetitions){
+
+  in_sample <- data[(1 + i):(window_size + i), ]
+  out_sample <- data[(window_size + i + 1):(nrow(data)), ]
+
+  level_sample_AR13_IC[(1:nrow(in_sample)) , (i+1)] <- in_sample$prod_ind
+
+  sample_and_predicted[(1:nrow(in_sample)) , (i+1)] <- in_sample$desas_prod
+
+  xts_in_sample <- ts(in_sample$desas_prod)
+
+  print(i)
+
+  for (j in 1:horizonte){
+
+    saved_models_AR13_IC[[i+1]] <- dynlm(xts_in_sample ~ L(xts_in_sample , (j):(j+12)))[[1]]
+
+
+      low <- window_size - j  #índice para a observação "t-j"
+      up <- window_size  - j - 12 #índice para a obserção de defasagem 13
+
+      aux_vec_lags <- as.matrix(rep(1 , times = 14), nrow = 1 , ncol = 14)
+
+      aux_vec_lags[2:14] <- sample_and_predicted[low:up , (1+i)]
+
+      aux_vec_lags <- t(aux_vec_lags)
+
+      aux_factor <- aux_vec_lags %*%
+        saved_models_AR13_IC[[i + 1]]
+
+
+      resid_estimated <- sample_and_predicted[window_size , (1+i)] - # observação
+                                                                      ## em "t"
+        aux_factor[[1]] # estimativa para t da produção desasonalizada                                             
+
+      level_sample_AR13_IC[(nrow(in_sample) + j) , (i + 1)] <- 
+        level_sample_AR13[(nrow(in_sample) + j) , (i + 1)] + # Estimativa usando
+                                                              ## modelo AR13
+        
+        resid_estimated # resíduo estimado do tempo "t"
+      
+  }
+  
+  
+
+}
+```
+
+## Modelo utilizando clusterização
+
+Aqui faço aplico a clusterização hierárquica utilizando a métrica DTW (date 
+time warping) utilizando tuple de 3 observações, agregadas sequencialmente. 
+Após isso, comparo se o cluster da última tuple é igual ao da anterior ou da
+antepenúltima. Se forem iguais, o valor predito do nível será o do modelo *AR13*
+e se forem diferentes, isso indica quebra estrutural e, portanto, o valor 
+predito será o do modelo *DDD*. As observações da tuple é a produção industrial
+desasonalizada. Portanto, estou avaliando se houve quebra na produção industrial
+desasonalizada.
+
+
+```{r}
+
+struc_break_cluster <- c()
+
+for(i in 0:repetitions){
+
+  in_sample <- data[(1 + i):(window_size + i), ]
+  in_sample_cluster <- in_sample
+  out_sample <- data[(window_size + i + 1):(nrow(data)), ]
+
+  level_sample_cluster[(1:nrow(in_sample)) , (i+1)] <- in_sample$prod_ind
+  
+  level_sample_cluster_combination[(1:nrow(in_sample)) , (i+1)] <- in_sample$prod_ind
+  
+  # Aqui vou elimando as primeiras observações até que o total de observações
+  ## seja divisível por 3 (para garantir que consigo agregar as observações
+  ### em tuples de 3 observações)
+  
+  while( length(in_sample[,1]) %% 3 == 1){
+
+    in_sample_cluster <- in_sample[2:nrow(in_sample) , ]
+
+  }
+  
+  ###
+  
+  # Aqui ordeno de forma decrescente minha amostra, para que a primeira 
+  ## observação na amostra na verdade seja a última observação da amostra
+  ### original
+  
+  in_sample_cluster <- in_sample_cluster[order(in_sample$date , decreasing = TRUE),]
+
+  ###
+  
+  # Organizando em tuples
+  
+  ClusterData <- rollapply(data = in_sample_cluster$desas_prod, 3 , by = 3, c)
+
+  ###
+  
+  # Aplicando a clusterização com o número de clusters iguais a 3 (k=3).
+  
+  DtwClust <- tsclust(ClusterData, k = 3L,
+                      type="hierarchical", distance="dtw", preproc = zscore)
+
+  ###
+
+  # Comparando o último cluster com o penúltimo e o antepenúltimo e atribuindo
+  ## os valores da variável em nível
+  
+  if(DtwClust@cluster[1]==DtwClust@cluster[2]|DtwClust@cluster[1]==DtwClust@cluster[3]){
+
+    level_sample_cluster[
+      (nrow(in_sample) + 1):(nrow(in_sample) + horizonte), (i + 1)] <-
+      level_sample_AR13[(nrow(in_sample) + 1):(nrow(in_sample) + horizonte), (i + 1)]
+    
+    level_sample_cluster_combination[
+      (nrow(in_sample) + 1):(nrow(in_sample) + horizonte), (i + 1)] <-
+      level_sample_combination_non_robust[(nrow(in_sample) + 1):(nrow(in_sample) + horizonte), (i + 1)]
+
+  struc_break_cluster[i+1] <- NA 
+    
+  } else {
+
+    level_sample_cluster[
+      (nrow(in_sample) + 1):(nrow(in_sample) + horizonte), (i + 1)] <-
+      level_sample_DDD[
+        (nrow(in_sample) + 1):(nrow(in_sample) + horizonte), (i + 1)]
+    
+    level_sample_cluster_combination[
+      (nrow(in_sample) + 1):(nrow(in_sample) + horizonte), (i + 1)] <-
+      level_sample_combination[
+        (nrow(in_sample) + 1):(nrow(in_sample) + horizonte), (i + 1)]
+
+    struc_break_cluster[i+1] <- as.character(data$date[(50+i+1)])
+
+  }
+
+  ###
+  
+  print(i)
+
+}
+```
+
+### Quebras Identicadas via clusterização
+
+```{r}
+
+print(struc_break_cluster[!is.na(struc_break_cluster)])
+
+```
+
+
+## Combinação dos modelos DDD e SDD
+
+```{r}
+
+level_sample_combination <- (level_sample_DDD + level_sample_SDD) * 1/2
+
+```
+
+
+## Combinação dos modelos robustos
+
+```{r}
+
+level_sample_combination_robust <- (level_sample_DDD + level_sample_SDD + 
+                                      level_sample_AR13_IC) * 1/3
+
+```
+
+
+## Combinação modelos não robustos
+
+```{r}
+
+level_sample_combination_non_robust <- (level_sample_AR1 + level_sample_AR13) * 1/2
+
+```
+
+```{r}
+
+DATA <- as.data.frame(data$date[(window_size+1):(nrow(data)-11)])
+
+```
+
+
+
+# Método Iterado
+
+## Listas
+
+```{r , results='hide'}
+
+interative_saved_models_AR13 <- list()
+
+interative_saved_models_AR1 <- list()
+
+interative_saved_models_RW <- list()
+
+interative_saved_models_DDD <- list()
+
+interative_saved_models_DDD_AR <- list()
+
+interative_saved_models_DDD_AR_LASSO <- list()
+
+interative_saved_models_DDD_AR_ADALASSO <- list()
+
+interative_saved_models_SDD <- list()
+
+interative_saved_models_AR13_IC <- list()
+
+sample_and_predicted <- replicate(1:(window_size + horizonte),
+                                  n = repetitions+1) %>%
+  as.data.frame()
+
+sample_and_predicted <- as.data.frame(sample_and_predicted)
+
+interative_level_sample_AR13 <- sample_and_predicted
+interative_level_sample_AR1 <- sample_and_predicted
+interative_level_sample_RW <- sample_and_predicted
+interative_level_sample_DDD <-sample_and_predicted
+interative_level_sample_SDD <-sample_and_predicted
+interative_level_sample_AR13_IC <- sample_and_predicted
+interative_level_sample_cluster <- sample_and_predicted
+interative_level_sample_cluster_combination <- sample_and_predicted
+interative_level_sample_cluster_rls <- sample_and_predicted
+interative_level_sample_cluster_check <- sample_and_predicted
+interative_level_sample_DDD_AR <-sample_and_predicted
+interative_level_sample_DDD_AR_LASSO <-sample_and_predicted
+interative_level_sample_DDD_AR_ADALASSO <-sample_and_predicted
+
+
+```
+
+## AR 13 Iterativo
+
+Aqui, basicamente tenho:
+
+1. $\hat{\Delta_{12}prod\_ind_{t+h}} = \hat{\beta_{0}} + \sum_{i=1}^{13}\hat{\beta_{i}}\Delta_{12}\hat{prod\_ind_{t+h-i}} $
+
+Ou seja, para as projeções da janela h, utilizamos tanto observações in_sample 
+quanto as projeções das janelas "h-1".
+
+```{r , results='hide'}
+for(i in 0:repetitions){
+
+  in_sample <- data[(1 + i):(window_size + i), ]
+  out_sample <- data[(window_size + i + 1):(nrow(data)), ]
+
+  interative_level_sample_AR13[(1:nrow(in_sample)) , (i+1)] <- 
+    in_sample$prod_ind
+
+  sample_and_predicted[(1:nrow(in_sample)) , (i+1)] <- in_sample$desas_prod
+
+  xts_in_sample <- xts(x = in_sample$desas_prod,
+                       order.by = as.Date(in_sample$date))
+
+  interative_saved_models_AR13[[i+1]] <- arima(xts_in_sample , order = c(13,0,0) ,
+                                  include.mean = TRUE , method = "CSS")[[1]]
+  
+  # A função ARIMA() retorna ao invés do intercepto, a média calculada. Estou
+  ## Transformando novamente em intercepto
+  
+  interative_saved_models_AR13[[i+1]][[14]] <- 
+    interative_saved_models_AR13[[i+1]][[14]]*( 1- 
+                                  sum(interative_saved_models_AR13[[i+1]][1:13])
+  )
+  
+  sum(interative_saved_models_AR13[[i+1]][1:13])
+  
+  ###
+  
+  print(i)
+  
+  for (j in 1:horizonte){
+
+    ### A grande diferença é que aqui os índices dependem de j
+    
+    low <- window_size + j - 1
+    up <- window_size + j - 13
+
+    ###
+    
+    aux_vec_lags <- as.matrix(rep(1 , times = 14), nrow = 1 , ncol = 14)
+
+    # Como os índices andam com a amostra, estou utilizando as predições
+    ## anteriores como "observação"
+    
+    aux_vec_lags[1:13] <- sample_and_predicted[low:up , (1+i)]
+
+    ###
+    
+    aux_vec_lags <- t(aux_vec_lags)
+
+    aux_factor <- aux_vec_lags %*%
+      interative_saved_models_AR13[[i + 1]]
+
+
+    sample_and_predicted[(nrow(in_sample) + j) , (i + 1)] <- aux_factor[[1]]
+
+    interative_level_sample_AR13[(nrow(in_sample) + j) , (i + 1)] <- 
+      aux_factor[[1]] +
+      interative_level_sample_AR13[(nrow(in_sample) + j - 12) , (i + 1)]
+
+
+
+  }
+
+}
+```
+
+
+## AR 1
+
+```{r , results='hide'}
+for(i in 0:repetitions){
+
+  in_sample <- data[(1 + i):(window_size + i), ]
+  out_sample <- data[(window_size + i + 1):(nrow(data)), ]
+
+  interative_level_sample_AR1[(1:nrow(in_sample)) , (i+1)] <- 
+    in_sample$prod_ind
+
+  sample_and_predicted[(1:nrow(in_sample)) , (i+1)] <- in_sample$desas_prod
+
+  xts_in_sample <- xts(x = in_sample$desas_prod,
+                       order.by = as.Date(in_sample$date))
+
+  interative_saved_models_AR1[[i+1]] <- arima(xts_in_sample , order = c(1,0,0) ,
+                                  include.mean = TRUE , method = "CSS")[[1]]
+  
+  # A função ARIMA() retorna ao invés do intercepto, a média calculada. Estou
+  ## Transformando novamente em intercepto
+  
+  interative_saved_models_AR1[[i+1]][[2]] <- 
+    interative_saved_models_AR1[[i+1]][[2]]*( 1- 
+                                  interative_saved_models_AR13[[i+1]][1])
+  
+  
+  ###
+  
+  print(i)
+  
+  for (j in 1:horizonte){
+
+    ### A grande diferença é que aqui os índices dependem de j
+    
+    low <- window_size + j - 1
+    up <- window_size + j - 13
+
+    ###
+    
+    aux_vec_lags <- as.matrix(rep(1 , times = 2), nrow = 1 , ncol = 2)
+
+    # Como os índices andam com a amostra, estou utilizando as predições
+    ## anteriores como "observação"
+    
+    aux_vec_lags[1] <- sample_and_predicted[low, (1+i)]
+
+    ###
+    
+    aux_vec_lags <- t(aux_vec_lags)
+
+    aux_factor <- aux_vec_lags %*%
+      interative_saved_models_AR1[[i + 1]]
+
+
+    sample_and_predicted[(nrow(in_sample) + j) , (i + 1)] <- aux_factor[[1]]
+
+    interative_level_sample_AR1[(nrow(in_sample) + j) , (i + 1)] <- 
+      aux_factor[[1]] +
+      interative_level_sample_AR1[(nrow(in_sample) + j - 12) , (i + 1)]
+
+
+
+  }
+
+}
+```
+
+## DDD AR 13
+
+```{r , results='hide'}
+
+### Gerando objetos 
+
+desas_prod <-  replicate(1:(window_size + horizonte),
+                         n = repetitions+1) %>%
+  as.data.frame()
+
+###
+
+
+for(i in 0:repetitions){
+
+  in_sample <- data[(1 + i):(window_size + i), ]
+  out_sample <- data[(window_size + i + 1):(nrow(data)), ]
+
+  interative_level_sample_DDD_AR[(1:nrow(in_sample)) , (i+1)] <- in_sample$prod_ind
+
+  sample_and_predicted[(1:nrow(in_sample)) , (i+1)] <- in_sample$d_desas_prod
+
+  desas_prod[(1:nrow(in_sample)) , (i+1)] <- in_sample$desas_prod
+
+  xts_in_sample <- xts(x = in_sample$d_desas_prod,
+                       order.by = as.Date(in_sample$date))
+
+
+  interative_saved_models_DDD_AR[[i+1]] <- interative_saved_models_AR13[[i+1]][1:13]
+
+
+  print(i)
+
+  for (j in 1:horizonte){
+
+    low <- window_size + j - 1
+    up <- window_size + j - 13
+
+    aux_vec_lags <- as.matrix(rep(1 , times = 13), nrow = 1 , ncol = 13)
+
+    # Como os índices andam com a amostra, estou utilizando as predições
+    ## anteriores como "observação"
+    
+    aux_vec_lags[1:13] <- sample_and_predicted[low:up , (1+i)]
+
+    ###
+    
+    aux_vec_lags <- t(aux_vec_lags)
+    
+    aux_factor <- aux_vec_lags %*%
+      interative_saved_models_DDD_AR[[i + 1]]
+    
+    ## 1.
+    sample_and_predicted[(nrow(in_sample) + j) , (i + 1)] <-
+      aux_factor
+    
+    ##
+    
+    ## 2.
+    desas_prod[(nrow(in_sample) + j) , (i + 1)] <-
+      sample_and_predicted[(nrow(in_sample) + j) , (i + 1)]+
+      desas_prod[low , (1+i)]
+    
+    ##
+    
+    ##3.
+    interative_level_sample_DDD_AR[(nrow(in_sample) + j) , (i + 1)] <-
+      desas_prod[(nrow(in_sample) + j) , (i + 1)] + 
+      interative_level_sample_DDD_AR[defas_12 , (1+i)]
+
+    ##
+
+  }
+}
+```
+
+## DDD Iterativo
+
+1. $\hat{\Delta\Delta_{12}prod\_ind_{t+h}} = \hat{\beta_{1}}\hat{\Delta\Delta_{12}prod\_ind_{t+h-1}}$
+
+2. $\hat{\Delta_{12}prod\_ind_{t+h}} = \hat{\Delta_{12}prod\_ind_{t+h-1}} + \hat{\beta_{1}}\hat{\Delta\Delta_{12}prod\_ind_{t+h-1}}$
+
+3. $\hat{prod\_ind_{t+h}} = prod\_ind_{t+h-12} + \hat{\Delta_{12}prod\_ind_{t+h-1}} + \hat{\beta_{1}}\hat{\Delta\Delta_{12}prod\_ind_{t+h-1}}$
+
+```{r , results='hide'}
+
+### Gerando objetos 
+
+desas_prod <-  replicate(1:(window_size + horizonte),
+                         n = repetitions+1) %>%
+  as.data.frame()
+
+###
+
+
+for(i in 0:repetitions){
+
+  in_sample <- data[(1 + i):(window_size + i), ]
+  out_sample <- data[(window_size + i + 1):(nrow(data)), ]
+
+  interative_level_sample_DDD[(1:nrow(in_sample)) , (i+1)] <- in_sample$prod_ind
+
+  sample_and_predicted[(1:nrow(in_sample)) , (i+1)] <- in_sample$d_desas_prod
+
+  desas_prod[(1:nrow(in_sample)) , (i+1)] <- in_sample$desas_prod
+
+  xts_in_sample <- xts(x = in_sample$d_desas_prod,
+                       order.by = as.Date(in_sample$date))
+
+
+  interative_saved_models_DDD[[i+1]] <- interative_saved_models_AR1[[i+1]][1]
+
+
+  print(i)
+
+  for (j in 1:horizonte){
+
+    defas_1 <- window_size + j - 1
+
+    defas_2 <- window_size + j - 2
+
+    defas_12 <- window_size + j - 12
+
+    defas_13 <-  window_size + j - 13
+
+    defas_14 <-  window_size+ j - 14
+    
+    ## 1.
+    sample_and_predicted[(nrow(in_sample) + j) , (i + 1)] <-
+      interative_saved_models_DDD[[i + 1]][[1]]*
+      sample_and_predicted[defas_1 , (i+1)]
+    
+    ##
+    
+    ## 2.
+    desas_prod[(nrow(in_sample) + j) , (i + 1)] <-
+      sample_and_predicted[(nrow(in_sample) + j) , (i + 1)]+
+      desas_prod[defas_1 , (1+i)]
+    
+    ##
+    
+    ##3.
+    interative_level_sample_DDD[(nrow(in_sample) + j) , (i + 1)] <-
+      desas_prod[(nrow(in_sample) + j) , (i + 1)] + 
+      interative_level_sample_DDD[defas_12 , (1+i)]
+
+    ##
+
+  }
+}
+
+```
+
+
+## RW Iterativo
+
+Aqui, fiz da seguinte forma:
+
+1. $\hat{\Delta_{12}prod\_ind_{t+h}} = \Delta_{12}prod\_ind_{t+h-1}$
+2. $\hat{prod\_ind_{t+h}} = prod\_ind_{t+h-12} + \hat{\Delta_{12}prod\_ind_{t+h}}$
+
+
+```{r , results='hide'}
+
+for(i in 0:repetitions){
+
+  in_sample <- data[(1 + i):(window_size + i), ]
+  out_sample <- data[(window_size + i + 1):(nrow(data)), ]
+
+  interative_level_sample_RW[(1:nrow(in_sample)) , (i+1)] <- in_sample$prod_ind
+  sample_and_predicted[(1:nrow(in_sample)) , (i+1)] <- in_sample$desas_prod
+
+
+  print(i)
+
+  for (j in 1:horizonte){
+
+    low <- window_size + j - 1
+    up <- window_size + j - 13
+
+    sample_and_predicted[(nrow(in_sample) + j) , (i + 1)] <- 
+      sample_and_predicted[(nrow(in_sample) + j - 1) , (i + 1)]
+
+    interative_level_sample_RW[(nrow(in_sample) + j) , (i + 1)] <- 
+      sample_and_predicted[(nrow(in_sample) + j) , (i + 1)] +
+      interative_level_sample_RW[(nrow(in_sample) + j - 12) , (i + 1)]
+
+    
+  }
+
+}
+```
+
+
+
+
+
+
+
+## SDD Iterativo
+
+1. $(\Delta_{12}prod\_ind_{t+h} - \frac{1}{4}\sum_{i=1}^{4}\Delta_{12}prod\_ind_{t+h-1}) = \hat{\beta_{1}}(\Delta_{12}prod\_ind_{t+h-1}- \frac{1}{4}\sum_{i=1}^{4}\Delta_{12}prod\_ind_{t+h-2})$
+
+2. $\Delta_{12}prod\_ind_{t+h} = \frac{1}{4}\sum_{i=1}^{4}\Delta_{12}prod\_ind_{t+h-1} + \hat{\beta_{1}}(\Delta_{12}prod\_ind_{t+h-1}- \frac{1}{4}\sum_{i=1}^{4}\Delta_{12}prod\_ind_{t+h-2})$
+
+3. $prod\_ind_{t+h} =prod\_ind_{t+h-12} + \Delta_{12}prod\_ind_{t+h}$
+
+```{r , results='hide'}
+
+## Limpando e gerando objetos
+
+rm(desas_prod)
+sdd_ma <- replicate(1:(window_size + horizonte),
+                                  n = repetitions+1) %>%
+  as.data.frame()
+
+defas_sdd_ma <- 0
+desas_prod <-  replicate(1:(window_size + horizonte),
+                     n = repetitions+1) %>%
+  as.data.frame()
+
+###
+
+for(i in 0:repetitions){
+
+  in_sample <- data[(1 + i):(window_size + i), ]
+  out_sample <- data[(window_size + i + 1):(nrow(data)), ]
+
+  interative_level_sample_SDD[(1:nrow(in_sample)) , (i+1)] <- in_sample$prod_ind
+
+  sample_and_predicted[(1:nrow(in_sample)) , (i+1)] <- in_sample$sdd_desas_prod
+
+  sdd_ma[(1:nrow(in_sample)) , (i+1)] <- in_sample$sdd_MA
+
+  desas_prod[(1:nrow(in_sample)) , (i+1)] <- in_sample$desas_prod
+
+  xts_in_sample <- xts(x = in_sample$sdd_desas_prod,
+                       order.by = as.Date(in_sample$date))
+
+
+  interative_saved_models_SDD[[i+1]] <- interative_saved_models_AR1[[i+1]][1]
+
+
+  print(i)
+
+  for (j in 1:horizonte){
+
+    low <- window_size + j - 1
+
+    up <- window_size + j - 12
+
+    sdd_ma[(nrow(in_sample) + j) , (i + 1)] <-
+      (desas_prod[(nrow(in_sample) + j - 1), (i + 1)] +
+         desas_prod[(nrow(in_sample) + j - 2), (i + 1)] +
+         desas_prod[(nrow(in_sample) + j - 3), (i + 1)] +
+         desas_prod[(nrow(in_sample) + j - 4), (i + 1)])/4
+    
+    ## 1.
+    aux_factor <- 
+      sample_and_predicted[low , (i+1)]*interative_saved_models_SDD[[i + 1]][[1]]
+    
+    sample_and_predicted[(nrow(in_sample) + j) , (i + 1)] <- aux_factor
+    
+    ##
+    
+    ## 2.
+    desas_prod[(nrow(in_sample) + j), (i + 1)] <-
+      sdd_ma[(nrow(in_sample) + j) , (i + 1)] + # Média móvel em "t" de 
+                                                ## desas_prod
+      
+      sample_and_predicted[(nrow(in_sample) + j) , (i + 1)] #sdd_desas_prod
+    
+    ##
+    
+    ##3.
+    interative_level_sample_SDD[(nrow(in_sample) + j) , (i + 1)] <-
+      interative_level_sample_SDD[(nrow(in_sample) + j - 12) , (i + 1)] +
+      desas_prod[(nrow(in_sample) + j), (i + 1)] 
+    
+  }
+}
+
+```
+
+
+## AR 13 + IC Iterativo
+
+```{r , results = FALSE}
+
+for(i in 0:repetitions){
+
+  in_sample <- data[(1 + i):(window_size + i), ]
+  out_sample <- data[(window_size + i + 1):(nrow(data)), ]
+
+  interative_level_sample_AR13_IC[(1:nrow(in_sample)) , (i+1)] <- 
+    in_sample$prod_ind
+
+  sample_and_predicted[(1:nrow(in_sample)) , (i+1)] <- in_sample$desas_prod
+
+  xts_in_sample <- xts(x = in_sample$desas_prod,
+                       order.by = as.Date(in_sample$date))
+
+  interative_saved_models_AR13_IC[[i+1]] <- arima(xts_in_sample , 
+                                                  order = c(13,0,0) ,
+                                  include.mean = TRUE , method = "CSS")
+
+  
+  ## 'Corrigindo' o intercepto
+  
+  interative_saved_models_AR13_IC[[i+1]][[14]] <- 
+    interative_saved_models_AR13_IC[[i+1]][[1]][14]*( 1 - 
+                        sum(interative_saved_models_AR13_IC[[i+1]][[1]][1:13]))
+  
+  sum(interative_saved_models_AR13_IC[[i+1]][[1]][1:13])
+      ## Aqui estou criando o resíduo estimado no meu forecast origin, ou seja,
+      ## denotando como o horizonte projetado como T + h com h = 1,..., H , estou
+      ## estimando o resíduo do meu modelo no tempo "T".
+  
+  low <- window_size - 1
+  up <- window_size  - 13
+
+  aux_vec_lags <- as.matrix(rep(1 , times = 14), nrow = 1 , ncol = 14)
+
+  aux_vec_lags[1:13] <- sample_and_predicted[low:up , (1+i)]
+
+  aux_vec_lags <- t(aux_vec_lags)
+
+  aux_factor <- aux_vec_lags %*% 
+    interative_saved_models_AR13_IC[[i + 1]][[1]]
+
+  resid_estimated <- sample_and_predicted[window_size , (1+i)] - aux_factor[[1]]
+
+  print(i)
+
+  for (j in 1:horizonte){
+
+
+    interative_level_sample_AR13_IC[(nrow(in_sample) + j) , (i + 1)] <- 
+        interative_level_sample_AR13[
+          (nrow(in_sample) + j) , (i + 1)] + # Estimativa usando
+                                                              ## modelo AR13
+        
+        resid_estimated # resíduo estimado do tempo "t"
+
+
+  }
+
+}
+
+```
+
+## tvp VAR
+
+```{r , results='hide'}
+for(i in 0:repetitions){
+
+  in_sample <- data[(1 + i):(window_size + i), ]
+  out_sample <- data[(window_size + i + 1):(nrow(data)), ]
+
+  level_sample_tvVAR[(1:nrow(in_sample)) , (i+1)] <- 
+    in_sample$prod_ind
+
+  sample_and_predicted[(1:nrow(in_sample)) , (i+1)] <- in_sample$desas_prod
+
+  xts_in_sample <- in_sample$desas_prod
+
+  
+  saved_models_tvVAR[[1+i]] <- tvAR(xts_in_sample , p = 13 , type = 'const')
+  
+  aux_factor <- tvReg:: forecast(saved_models_tvVAR[[1+i]] , n.ahead = horizonte)
+  
+  print(i)
+  
+  for (j in 1:horizonte){
+
+    sample_and_predicted[(nrow(in_sample) + j) , (i + 1)] <- aux_factor[[j]]
+
+    level_sample_tvVAR[(nrow(in_sample) + j) , (i + 1)] <- 
+      aux_factor[[j]] +
+      level_sample_tvVAR[(nrow(in_sample) + j - 12) , (i + 1)]
+
+  print(j)
+
+  }
+
+}
+```
+
+
+## AR (13) with LASSO
+
+```{r , results='hide'}
+
+for(i in 0:repetitions){
+
+  in_sample <- data[(1 + i):(window_size + i), ]
+  out_sample <- data[(window_size + i + 1):(nrow(data)), ]
+
+  level_sample_lasso_AR13[(1:nrow(in_sample)) , (i+1)] <- 
+    in_sample$prod_ind
+
+  sample_and_predicted[(1:nrow(in_sample)) , (i+1)] <- in_sample$desas_prod
+
+  
+  ## choosing the best model 
+  
+  xts_in_sample <- matrix_desas_prod[(1 + i):(window_size + i), ]
+  
+  xts_in_sample <- xts_in_sample[complete.cases(xts_in_sample) , ]
+  
+  y <- xts_in_sample$desas_prod
+  x <- data.matrix(xts_in_sample[ , -1])
+
+  cv_model <- cv.glmnet(x , y , alpha = 1)
+  
+  best_lambda <- cv_model$lambda.min
+  
+  coef(cv_model)
+  
+  best_model <- glmnet(x, y, alpha = 1, lambda = best_lambda)
+  
+  saved_models_lasso_ar13[[i+1]] <- coef(best_model)
+
+  
+  print(i)
+  
+  for (j in 1:horizonte){
+
+    ### A grande diferença é que aqui os índices dependem de j
+    
+    low <- window_size + j - 1
+    up <- window_size + j - 13
+
+    ###
+    
+    aux_vec_lags <- as.matrix(rep(1 , times = 13), nrow = 1 , ncol = 13)
+
+    # Como os índices andam com a amostra, estou utilizando as predições
+    ## anteriores como "observação"
+    
+    aux_vec_lags <- sample_and_predicted[low:up , (1+i)]
+
+    ###
+
+    sample_and_predicted[(nrow(in_sample) + j) , (i + 1)] <- 
+      predict(best_model, s = best_lambda, newx = aux_vec_lags)
+
+    level_sample_lasso_AR13[(nrow(in_sample) + j) , (i + 1)] <- 
+      sample_and_predicted[(nrow(in_sample) + j) , (i + 1)] +
+      level_sample_lasso_AR13[(nrow(in_sample) + j - 12) , (i + 1)]
+
+
+
+  }
+
+}
+```
+
+
+```{r , results='hide'}
+## AR (13) with ADALASSO
+
+
+for(i in 0:repetitions){
+
+
+  in_sample <- data[(1 + i):(window_size + i), ]
+  out_sample <- data[(window_size + i + 1):(nrow(data)), ]
+
+  level_sample_adalasso_AR13[(1:nrow(in_sample)) , (i+1)] <- 
+    in_sample$prod_ind
+
+  sample_and_predicted[(1:nrow(in_sample)) , (i+1)] <- in_sample$desas_prod
+
+  
+  ## choosing the best model 
+  
+  xts_in_sample <- matrix_desas_prod[(1 + i):(window_size + i), ]
+  
+  xts_in_sample <- xts_in_sample[complete.cases(xts_in_sample) , ]
+  
+  y <- xts_in_sample$desas_prod
+  x <- data.matrix(xts_in_sample[ , -1])
+
+  ridge1_cv <- cv.glmnet(x , y ,
+                       ## type.measure: loss to use for cross-validation.
+                       type.measure = "mse",
+                       ## K = 10 is the default.
+                       nfold = 10,
+                       ## ‘alpha = 1’ is the lasso penalty, and ‘alpha = 0’ the ridge penalty.
+                       alpha = 0)
+  
+  best_ridge_coef <- as.numeric(coef(ridge1_cv, s = ridge1_cv$lambda.min))[-1]
+  
+  alasso1_cv <- cv.glmnet(x, y,
+                        ## type.measure: loss to use for cross-validation.
+                        type.measure = "mse",
+                        ## K = 10 is the default.
+                        nfold = 10,
+                        ## ‘alpha = 1’ is the lasso penalty, and ‘alpha = 0’ the ridge penalty.
+                        alpha = 1,
+                        ##
+                        ## penalty.factor: Separate penalty factors can be applied to each
+                        ##           coefficient. This is a number that multiplies ‘lambda’ to
+                        ##           allow differential shrinkage. Can be 0 for some variables,
+                        ##           which implies no shrinkage, and that variable is always
+                        ##           included in the model. Default is 1 for all variables (and
+                        ##           implicitly infinity for variables listed in ‘exclude’). Note:
+                        ##           the penalty factors are internally rescaled to sum to nvars,
+                        ##           and the lambda sequence will reflect this change.
+                        penalty.factor = 1 / abs(best_ridge_coef),
+                        ## prevalidated array is returned
+                        keep = TRUE)
+  
+  best_lambda <- alasso1_cv$lambda.min
+  
+  coef(alasso1_cv, s = alasso1_cv$lambda.min)
+  
+  best_model <- glmnet(x, y, alpha = 1 , lambda = best_lambda , 
+                       penalty.factor = 1 / abs(best_ridge_coef),
+                        ## prevalidated array is returned
+                        keep = TRUE)
+  
+  coef(best_model)
+  
+  saved_models_adalasso_ar13[[i+1]] <- best_model
+
+  
+  print(i)
+  
+  for (j in 1:horizonte){
+
+    ### A grande diferença é que aqui os índices dependem de j
+    
+    low <- window_size + j - 1
+    up <- window_size + j - 13
+
+    ###
+    
+    aux_vec_lags <- as.matrix(rep(1 , times = 13), nrow = 1 , ncol = 13)
+
+    # Como os índices andam com a amostra, estou utilizando as predições
+    ## anteriores como "observação"
+    
+    aux_vec_lags <- sample_and_predicted[low:up , (1+i)]
+
+    ###
+
+    sample_and_predicted[(nrow(in_sample) + j) , (i + 1)] <- 
+      predict(best_model, s = best_lambda, newx = aux_vec_lags)
+
+    level_sample_adalasso_AR13[(nrow(in_sample) + j) , (i + 1)] <- 
+      sample_and_predicted[(nrow(in_sample) + j) , (i + 1)] +
+      level_sample_adalasso_AR13[(nrow(in_sample) + j - 12) , (i + 1)]
+  }
+
+}
+
+```
+
+
+## Clustering
+
+```{r , results='hide'}
+struc_break_cluster <- c()
+
+for(i in 0:repetitions){
+
+  in_sample <- data[(1 + i):(window_size + i), ]
+  in_sample_cluster <- in_sample
+  out_sample <- data[(window_size + i + 1):(nrow(data)), ]
+
+  aux_variable <- 0
+
+  interative_level_sample_cluster[(1:nrow(in_sample)) , (i+1)] <- 
+    in_sample$prod_ind
+  
+  interative_level_sample_cluster_combination[(1:nrow(in_sample)) , (i+1)] <- 
+    in_sample$prod_ind
+  
+
+  sample_and_predicted[(1:nrow(in_sample)) , (i+1)] <- in_sample$desas_prod
+
+  while( length(in_sample_cluster[,1]) %% 3 == 1){
+
+    in_sample_cluster <- in_sample_cluster[2:nrow(in_sample_cluster) , ]
+
+  }
+
+  in_sample_cluster <- in_sample_cluster[order(in_sample_cluster$date , 
+                                               decreasing = TRUE),]
+
+
+  ClusterData <- rollapply(data = in_sample_cluster$desas_prod, 3 , by = 3, c)
+
+  DtwClust <- tsclust(ClusterData, k = 3L,
+                      type="hierarchical", distance="dtw", preproc = zscore)
+
+
+  if(DtwClust@cluster[1]==DtwClust@cluster[2]|
+     DtwClust@cluster[1]==DtwClust@cluster[3]){
+
+    interative_level_sample_cluster[
+      (nrow(in_sample) + 1):(nrow(in_sample) + horizonte), (i + 1)] <-
+      interative_level_sample_AR13[
+        (nrow(in_sample) + 1):(nrow(in_sample) + horizonte), (i + 1)]
+    
+    interative_level_sample_cluster_combination[
+      (nrow(in_sample) + 1):(nrow(in_sample) + horizonte), (i + 1)] <-
+      interative_level_sample_combination_non_robust[
+        (nrow(in_sample) + 1):(nrow(in_sample) + horizonte), (i + 1)]
+    
+    struc_break_cluster[i+1] <- NA
+    
+  } else {
+
+    interative_level_sample_cluster[
+      (nrow(in_sample) + 1):(nrow(in_sample) + horizonte), (i + 1)] <-
+      interative_level_sample_DDD[
+        (nrow(in_sample) + 1):(nrow(in_sample) + horizonte), (i + 1)]
+    
+    interative_level_sample_cluster_combination[
+      (nrow(in_sample) + 1):(nrow(in_sample) + horizonte), (i + 1)] <-
+      interative_level_sample_combination[
+        (nrow(in_sample) + 1):(nrow(in_sample) + horizonte), (i + 1)]
+
+     struc_break_cluster[i+1] <- as.character(data$date[(50+i)])
+
+  }
+
+  print(i)
+
+}
+```
+
+## Clustering Recursive Least Squares
+
+```{r , results='hide'}
+
+## Recursive least squares
+
+data_recursive <- data
+
+desas_prod_1 <- Lag(data$desas_prod)[-1]
+desas_prod <- data$desas_prod[-1]
+intercept <- c(rep(1 , times = length(desas_prod_1)))
+
+matrix_x <- as.matrix(data.frame(desas_prod_1 , intercept))
+
+recursive_ls <- RLS(desas_prod, matrix_x)
+
+test <- recursive_ls$beta
+
+test <- as.data.frame(test)
+
+data$intercept_rls <- c(rep(NA , times = 31) , test$intercept)
+
+struc_break_cluster_rls <- c()
+
+for(i in 0:repetitions){
+
+  in_sample <- data[(1 + i):(window_size + i), ]
+  in_sample_cluster <- in_sample[!is.na(in_sample$intercept_rls) , ]
+  out_sample <- data[(window_size + i + 1):(nrow(data)), ]
+
+  level_sample_cluster_rls[(1:nrow(in_sample)) , (i+1)] <- in_sample$prod_ind
+  
+
+  
+  # Aqui vou elimando as primeiras observações até que o total de observações
+  ## seja divisível por 3 (para garantir que consigo agregar as observações
+  ### em tuples de 3 observações)
+
+    
+  while( length(in_sample_cluster[,1]) %% 3 == 1){
+
+    in_sample_cluster <- in_sample_cluster[2:nrow(in_sample_cluster) , ]
+
+  }
+  
+  ###
+  
+  # Aqui ordeno de forma decrescente minha amostra, para que a primeira 
+  ## observação na amostra na verdade seja a última observação da amostra
+  ### original
+  
+  in_sample_cluster <- in_sample_cluster[order(in_sample_cluster$date , decreasing = TRUE),]
+
+  ###
+  
+  # Organizando em tuples
+  
+  ClusterData <- rollapply(data = in_sample_cluster$intercept_rls, 3 , by = 3, c)
+
+  ###
+  
+  # Aplicando a clusterização com o número de clusters iguais a 3 (k=3).
+  
+  DtwClust <- tsclust(ClusterData, k = 3L,
+                      type="hierarchical", distance="dtw", preproc = zscore)
+
+  ###
+print("b")
+  # Comparando o último cluster com o penúltimo e o antepenúltimo e atribuindo
+  ## os valores da variável em nível
+  
+  if(DtwClust@cluster[1]==DtwClust@cluster[2]|DtwClust@cluster[1]==DtwClust@cluster[3]){
+
+    level_sample_cluster_rls[
+      (nrow(in_sample) + 1):(nrow(in_sample) + horizonte), (i + 1)] <-
+      level_sample_AR13[(nrow(in_sample) + 1):(nrow(in_sample) + horizonte), (i + 1)]
+    
+    interative_level_sample_cluster_rls[
+      (nrow(in_sample) + 1):(nrow(in_sample) + horizonte), (i + 1)] <-
+      interative_level_sample_AR13[(nrow(in_sample) + 1):(nrow(in_sample) + horizonte), (i + 1)]
+
+  struc_break_cluster_rls[i+1] <- NA 
+    
+  } else {
+
+    level_sample_cluster_rls[
+      (nrow(in_sample) + 1):(nrow(in_sample) + horizonte), (i + 1)] <-
+      level_sample_DDD[
+        (nrow(in_sample) + 1):(nrow(in_sample) + horizonte), (i + 1)]
+    
+    interative_level_sample_cluster_rls[
+      (nrow(in_sample) + 1):(nrow(in_sample) + horizonte), (i + 1)] <-
+      interative_level_sample_DDD[
+        (nrow(in_sample) + 1):(nrow(in_sample) + horizonte), (i + 1)]
+
+    struc_break_cluster_rls[i+1] <- as.character(data$date[(50+i+1)])
+
+  }
+
+  ###
+  
+  print(i)
+
+}
+```
+
+### Quebras Identificadas via clusterização
+
+```{r , echo = FALSE}
+
+print(struc_break_cluster[!is.na(struc_break_cluster)])
+
+print(struc_break_cluster_rls[!is.na(struc_break_cluster_rls)])
+
+
+```
+
+
+## Combinação de Forecasts
+
+```{r}
+interative_level_sample_combination <- (interative_level_sample_DDD + interative_level_sample_SDD) * 1/2
+```
+
+
+## Combinação de Forecasts ROBUST
+
+```{r}
+interative_level_sample_combination_robust <- (interative_level_sample_DDD + 
+                                          interative_level_sample_SDD + 
+                                          interative_level_sample_AR13_IC) * 1/3
+```
+
+
+# Previsões Autometrics
+
+```{r , results ='hide'}
+
+sample <- as.data.frame(matrix(nrow = 12 , ncol = repetitions+1))
+  
+for (i in 1:horizonte){
+  
+  sample[i , 1:ncol(sample) ] <- 
+    data$prod_ind[(window_size-12+i):(window_size-12+i+repetitions)] 
+  
+}
+
+dados_oxmetrics_desas_prod <- 
+  readxl::read_xlsx("previsoes_autometrix.xlsx", col_names = TRUE) |>
+  as.data.frame()
+
+dados_oxmetrics_desas_prod <- dados_oxmetrics_desas_prod[ , -1]
+
+dados_oxmetrics <- dados_oxmetrics_desas_prod + sample
+
+
+
+
+```
+
+## Combination non robust
+
+```{r}
+interative_level_sample_combination_non_robust <- (interative_level_sample_AR1 + 
+                                          interative_level_sample_AR13 + 
+                                          level_sample_adalasso_AR13 + 
+                                            level_sample_lasso_AR13 + 
+                                            dados_oxmetrics) * 1/5
+```
+
+
+
+
+
+
+
+
+
